@@ -168,27 +168,35 @@ def first_match(patterns, text, flags=re.IGNORECASE):
 
 
 def extract_invoice_fields(text):
-    """Best-effort extraction. Always review the results before saving.""" 
+    """Best-effort extraction. Optimized to handle disjointed PDF layouts.""" 
+    
+    # 1. Clean up weird whitespace types from the PDF text stream
+    text_clean = re.sub(r'[\xa0\t]+', ' ', text)
+
+    # 2. More resilient Invoice Number patterns
     invoice_number = first_match(
         [
-            r"\b(?:invoice\s*(?:number|no\.?|#|id)|"
-            r"inv\.?\s*(?:number|no\.?|#|id))\s*[:#-]?\s*"
-            r"([A-Z0-9][A-Z0-9/_-]{2,})",
-            r"\b(?:invoice|inv\.?)\s*[:#]\s*"
-            r"([A-Z0-9][A-Z0-9/_-]{2,})",
+            # Handles value directly following the label (allowing short numbers like #1)
+            r"\b(?:invoice\s*(?:number|no\.?|#|id)|inv\.?\s*(?:number|no\.?|#|id))\s*[:#-]?\s*([A-Z0-9][A-Z0-9/_-]*)\b",
+            
+            # Multi-line/Interleaved layout fallback: 
+            # Finds label, skips up to 40 characters (like column headers), captures the first alphanumeric block
+            r"\b(?:invoice\s*(?:number|no\.?|#|id)|inv\.?\s*(?:number|no\.?|#|id)).{1,40}?\b([A-Z0-9/_-]{2,15})\b",
+            
+            # Ultimate fallback if it just says "Invoice: VALUE" or "Inv: VALUE"
+            r"\b(?:invoice|inv\.?)\s*[:#]\s*([A-Z0-9][A-Z0-9/_-]*)\b",
         ],
-        text,
+        text_clean,
     )
-
 
     po_number = first_match(
         [
-            r"\b(?:purchase\s*order|P\.?\s*O\.?)\s*"
-            r"(?:number|no\.?|#)?\s*[:#-]?\s*"
-            r"([A-Z0-9][A-Z0-9/_-]{1,})"
+            r"\b(?:purchase\s*order|P\.?\s*O\.?)\s*(?:number|no\.?|#)?\s*[:#-]?\s*([A-Z0-9][A-Z0-9/_-]*)\b"
         ],
-        text,
+        text_clean,
     )
+
+    # ... Keep your date and amount logic here (using text_clean instead of text) ...
 
     date_text = first_match(
         [
