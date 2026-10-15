@@ -1,124 +1,76 @@
-
+"""Streamlit invoice tracker with review-first PDF extraction and Notion duplicate checks."""
 import re
 from datetime import date, datetime
+from decimal import Decimal, InvalidOperation
 from io import BytesIO
 
 import requests
 import streamlit as st
 from pypdf import PdfReader
 
-
-# -------------------- App setup --------------------
-
-st.set_page_config(
-    page_title="Invoice Duplicate Checker",
-    page_icon="🧾",
-    layout="wide",
-)
-
 NOTION_VERSION = "2025-09-03"
 NOTION_BASE_URL = "https://api.notion.com/v1"
 
 
-# -------------------- Notion API helpers --------------------
-
 def notion_request(method, path, token, **kwargs):
-    """Send a request to Notion and show a useful error if it fails."""
     headers = {
         "Authorization": f"Bearer {token}",
         "Notion-Version": NOTION_VERSION,
         "Content-Type": "application/json",
     }
-
     try:
-        response = requests.request(
-            method,
-            f"{NOTION_BASE_URL}{path}",
-            headers=headers,
-            timeout=30,
-            **kwargs,
-        )
+        response = requests.request(method, f"{NOTION_BASE_URL}{path}", headers=headers, timeout=30, **kwargs)
     except requests.RequestException as exc:
         raise RuntimeError(f"Could not reach Notion: {exc}") from exc
-
     if not response.ok:
         try:
             detail = response.json().get("message", response.text)
         except ValueError:
             detail = response.text
-        raise RuntimeError(
-            f"Notion returned HTTP {response.status_code}: {detail}"
-        )
-
+        raise RuntimeError(f"Notion returned HTTP {response.status_code}: {detail}")
     return response.json()
 
 
 def get_data_source_id(token, database_id):
-    """Find the data source belonging to the Invoice Tracker database."""
-    database = notion_request(
-        "GET", f"/databases/{database_id}", token
-    )
+    database = notion_request("GET", f"/databases/{database_id}", token)
     sources = database.get("data_sources", [])
-
     if not sources:
-        raise RuntimeError(
-            "No data source was returned for this database. "
-            "Check the database ID and Notion integration access."
-        )
-
-    # This app expects one invoice table/data source.
+        raise RuntimeError("No data source returned. Check database ID and integration permissions.")
     return sources[0]["id"]
 
 
 def get_all_invoices(token, data_source_id):
-    """Fetch all existing rows, following Notion pagination."""
-    invoices = []
-    cursor = None
-
+    invoices, cursor = [], None
     while True:
         payload = {"page_size": 100}
         if cursor:
             payload["start_cursor"] = cursor
-
-        result = notion_request(
-            "POST",
-            f"/data_sources/{data_source_id}/query",
-            token,
-            json=payload,
-        )
+        result = notion_request("POST", f"/data_sources/{data_source_id}/query", token, json=payload)
         invoices.extend(result.get("results", []))
-
         if not result.get("has_more"):
             break
         cursor = result.get("next_cursor")
-
+        if not cursor:
+            raise RuntimeError("Notion pagination was incomplete.")
     return invoices
 
 
 def property_text(prop):
-    """Read common Notion text-like property values."""
     if not prop:
         return ""
-
     kind = prop.get("type")
-
-    if kind == "title":
-        items = prop.get("title", [])
-    elif kind == "rich_text":
-        items = prop.get("rich_text", [])
-    elif kind == "select":
+    if kind in ("title", "rich_text"):
+        return "".join(item.get("plain_text", "") for item in prop.get(kind, []))
+    if kind == "select":
         return (prop.get("select") or {}).get("name", "")
-    elif kind == "number":
+    if kind == "number":
         value = prop.get("number")
         return "" if value is None else str(value)
-    elif kind == "date":
+    if kind == "date":
         return (prop.get("date") or {}).get("start", "")
-    elif kind == "url":
+    if kind == "url":
         return prop.get("url") or ""
-    else:
-        return ""
-
-    return "".join(item.get("plain_text", "") for item in items)
+    return ""
 
 
 def invoice_record(page):
@@ -135,116 +87,121 @@ def invoice_record(page):
     }
 
 
-# -------------------- PDF extraction --------------------
-
 def extract_pdf_text(pdf_bytes):
     reader = PdfReader(BytesIO(pdf_bytes))
-
     if reader.is_encrypted:
         try:
-            reader.decrypt("")
+            if not reader.decrypt(""):
+                raise ValueError("This PDF requires a password.")
         except Exception as exc:
-            raise ValueError(
-                "This PDF is password-protected. Please use an "
-                "unlocked PDF for this test."
-            ) from exc
-
-    #text = "\n".join(page.extract_text() or "" for page in reader.pages)
-    text = "\n".join(page.extract_text(extraction_mode="layout") or "" for page in reader.pages)    
+            raise ValueError("Please upload an unlocked PDF.") from exc
+    text = "\n".join(page.extract_text(extraction_mode="layout") or "" for page in reader.pages)
     if not text.strip():
-        raise ValueError(
-            "No selectable text was found. This may be a scanned PDF; "
-            "OCR support is not included in this first version."
-        )
-
+        raise ValueError("No selectable PDF text found. A scanned invoice needs OCR.")
     return text
 
 
-def first_match(patterns, text, flags=re.IGNORECASE):
+def first_match(patterns, text):
     for pattern in patterns:
-        match = re.search(pattern, text, flags)
-        if match:
-            return match.group(1).strip(" \t:#-")
+        m = re.search(pattern, text, re.IGNORECASE)
+        if m:
+            return m.group(1).strip(" \t:#-")
     return ""
 
-def extract_invoice_fields(text):
-    """Best-effort extraction. Handles 'Track ID' variants and spatial column formatting.""" 
-    
-    # Pre-clean excessive horizontal gaps created by layout extraction mode
-    text_clean = re.sub(r' +', ' ', text)
 
-    invoice_number = first_match(
-        [
-            # 1. Matches Invoice Track ID / Tracking ID / Reference ID variants
-            r"\b(?:invoice\s*)?(?:track(?:ing)?\s*id|reference\s*no\.?|billing\s*code)\s*[:#\s-]*\s*([A-Z0-9][A-Z0-9/_-]*)\b",
-            
-            # 2. Standard variants (Invoice Number, Inv #, No.)
-            r"\b(?:invoice\s*(?:number|no\.?|#|id)|inv\.?\s*(?:number|no\.?|#|id))\s*[:#\s-]*\s*([A-Z0-9][A-Z0-9/_-]*)\b",
-            
-            # 3. Aggressive loose keyword fallback (Invoice: VALUE)
-            r"\b(?:invoice|inv\.?)\s*[:#\s-]*\s*([A-Z0-9][A-Z0-9/_-]*)\b",
-        ],
-        text_clean,
-    )
+MONEY = r"(?<![\w\d])(?:CAD|USD)?\s*\$?\s*([0-9]{1,3}(?:,[0-9]{3})+(?:\.\d{2})?|[0-9]+\.\d{2})(?!\d)"
+# Labels are deliberately searched from strongest to weakest, independent of their location.
+TOTAL_LABELS = [
+    r"aggregated\s+balance\s+payable\s+due",
+    r"grand\s+total\s+balance\s+due",
+    r"(?:grand\s+total|invoice\s+total|total\s+amount|total\s+due|amount\s+due|balance\s+due|balance\s+payable)",
+    r"(?<!sub)\btotal\b(?!\s+(?:tax|gst|hst|vat))",
+]
 
-    po_number = first_match(
-        [
-            r"\b(?:purchase\s*order|P\.?\s*O\.?)\s*(?:number|no\.?|#)?\s*[:#\s-]*\s*([A-Z0-9][A-Z0-9/_-]*)\b"
-        ],
-        text_clean,
-    )
 
-    date_text = first_match(
-        [
-            r"\b(?:invoice\s*date|date\s*of\s*invoice|date)\s*[:#\s-]*\s*(\d{4}[-/]\d{1,2}[-/]\d{1,2})",
-            r"\b(?:invoice\s*date|date\s*of\s*invoice|date)\s*[:#\s-]*\s*(\d{1,2}[-/]\d{1,2}[-/]\d{2,4})",
-        ],
-        text_clean,
-    )
+def extract_amount(lines):
+    """Use final-payable labels, never a blind CAD / $ match or a line-item value."""
+    for label in TOTAL_LABELS:
+        for line in reversed(lines):
+            match = re.search(label, line, re.IGNORECASE)
+            if not match:
+                continue
+            tail = line[match.end():]
+            # Currency/parenthetical text is allowed between label and amount.
+            values = list(re.finditer(MONEY, tail, re.IGNORECASE))
+            if values:
+                try:
+                    return Decimal(values[-1].group(1).replace(",", ""))
+                except InvalidOperation:
+                    pass
+    return None
 
-    invoice_date = ""
-    if date_text:
-        for fmt in (
-            "%Y-%m-%d", "%Y/%m/%d",
-            "%m/%d/%Y", "%d/%m/%Y",
-            "%m-%d-%Y", "%d-%m-%Y",
-            "%m/%d/%y", "%d/%m/%y",
-        ):
-            try:
-                invoice_date = datetime.strptime(date_text, fmt).date().isoformat()
-                break
-            except ValueError:
-                pass
 
-    amount_text = first_match(
-        [
-            r"\b(?:total\s*amount|invoice\s*total|amount\s*due|balance\s*due|grand\s*total|total)\s*[:$\s]*\s*(?:CAD\s*)?\$?\s*([\d,]+\.\d{2})",
-            r"\b(?:CAD|USD)\s*\$?\s*([\d,]+\.\d{2})",
-        ],
-        text_clean,
-    )
+def extract_company(lines):
+    """Vendor/sender, NOT customer under Invoice To / Bill To."""
+    legal_suffix = re.compile(r"\b(?:LLC|L\.L\.C\.|Inc\.?|Incorporated|Ltd\.?|Limited|Corp\.?|Corporation|GmbH|Co\.)\b", re.I)
+    skip = re.compile(r"^(?:invoice|commercial invoice|statement|bill|receipt|tax invoice|billing statement|page\s+\d+|date\b)", re.I)
+    header = lines[:12]
+    # Explicit vendor headers take precedence when available.
+    for line in header:
+        m = re.search(r"(?:vendor|supplier|seller|issued\s+by|from)\s*:\s*(.+)", line, re.I)
+        if m:
+            return re.split(r"\s{2,}|\s*[•|]\s*", m.group(1).strip())[0].strip()
+    # Header only: exclude downstream bill-to/client columns by stopping at their markers.
+    for line in header:
+        if re.search(r"\b(?:invoice\s+to|bill\s+to|client\s+corporate\s+entity|ship\s+to)\s*:", line, re.I):
+            break
+        candidate = re.split(r"\s{2,}|\s*[•|]\s*", line.strip())[0].strip()
+        if not candidate or skip.match(candidate):
+            continue
+        if legal_suffix.search(candidate):
+            return candidate[:100]
+    # Conservative fallback: header line with vendor email/address, never the title.
+    for line in header[:5]:
+        candidate = re.split(r"\s{2,}|\s*[•|]\s*", line.strip())[0].strip()
+        if candidate and not skip.match(candidate) and ("@" in line or "•" in line):
+            return candidate[:100]
+    return ""  # Ask for review rather than silently recording customer as vendor.
 
-    amount = None
-    if amount_text:
+
+def parse_date(value):
+    value = value.strip().replace(",", "")
+    for fmt in (
+        "%Y-%m-%d", "%Y/%m/%d", "%m/%d/%Y", "%d/%m/%Y",
+        "%m-%d-%Y", "%d-%m-%Y", "%b %d %Y", "%B %d %Y",
+        "%d %b %Y", "%d %B %Y", "%m/%d/%y", "%d/%m/%y",
+    ):
         try:
-            amount = float(amount_text.replace(",", ""))
+            return datetime.strptime(value, fmt).date().isoformat()
         except ValueError:
-            amount = None
+            continue
+    return ""
 
-    lines = [line.strip() for line in text_clean.splitlines() if line.strip()]
-    company = lines[0][:100] if lines else ""
 
+def extract_invoice_fields(text):
+    # Preserve line breaks and multi-column layout for accurate header/total identification.
+    lines = [line.rstrip() for line in text.splitlines() if line.strip()]
+    clean = re.sub(r"[ \t]+", " ", text)
+    invoice_number = first_match([
+        r"\b(?:invoice\s*)?(?:track(?:ing)?\s*id|reference\s*(?:id|no\.?|number)|billing\s*code)\s*[:#\s-]*([A-Z0-9][A-Z0-9/_-]*)\b",
+        r"\b(?:invoice\s*(?:number|no\.?|#|id)|inv\.?\s*(?:number|no\.?|#|id))\s*[:#\s-]*([A-Z0-9][A-Z0-9/_-]*)\b",
+        r"\b(?:invoice|inv\.?)\s*[:#-]\s*([A-Z0-9][A-Z0-9/_-]*)\b",
+    ], clean)
+    po_number = first_match([
+        r"\b(?:purchase\s*order|P\.?\s*O\.?\b)\s*(?:number|no\.?|#)?\s*[:#\s-]+([A-Z0-9][A-Z0-9/_-]*)\b"
+    ], clean)
+    date_value = first_match([
+        r"\b(?:invoice\s*date|issue\s*date|date\s*generated|date\s*of\s*invoice)\s*:\s*(\d{4}[-/]\d{1,2}[-/]\d{1,2}|\d{1,2}[-/]\d{1,2}[-/]\d{2,4}|[A-Za-z]+\s+\d{1,2},?\s+\d{4})",
+        r"\b(?:invoice\s*date|issue\s*date|date\s*generated|date\s*of\s*invoice)\s*:\s*(\d{1,2}\s+[A-Za-z]+\s+\d{4})",
+    ], clean)
     return {
         "invoice_number": invoice_number,
-        "company": company,
-        "invoice_date": invoice_date,
-        "amount": amount,
+        "company": extract_company(lines),
+        "invoice_date": parse_date(date_value) if date_value else "",
+        "amount": extract_amount(lines),
         "po_number": po_number,
     }
 
-
-
-# -------------------- Duplicate checking --------------------
 
 def normalize(value):
     return re.sub(r"[^a-z0-9]", "", str(value or "").lower())
@@ -252,335 +209,192 @@ def normalize(value):
 
 def amount_value(value):
     try:
-        return round(float(str(value).replace(",", "").replace("$", "")), 2)
-    except (TypeError, ValueError):
+        if value is None or str(value).strip() == "":
+            return None
+        return Decimal(str(value).replace(",", "").replace("$", "").strip()).quantize(Decimal("0.01"))
+    except (InvalidOperation, ValueError):
         return None
 
 
 def find_duplicates(candidate, existing):
-    exact = []
-    possible = []
-
+    exact, possible = [], []
     candidate_number = normalize(candidate["invoice_number"])
     candidate_company = normalize(candidate["company"])
     candidate_po = normalize(candidate["po_number"])
     candidate_amount = amount_value(candidate["amount"])
-
     for old in existing:
         old_number = normalize(old["invoice_number"])
         old_company = normalize(old["company"])
         old_po = normalize(old["po_number"])
         old_amount = amount_value(old["amount"])
-
-        # Exact invoice-number match, regardless of company.
+        # Preserve original behavior: any exact invoice number is flagged, even across vendors.
         if candidate_number and old_number == candidate_number:
             exact.append(old)
             continue
-
-        # Potential duplicate: same company and amount, optionally same PO.
-        same_company = (
-            candidate_company
-            and old_company
-            and candidate_company == old_company
-        )
-        same_amount = (
-            candidate_amount is not None
-            and old_amount is not None
-            and candidate_amount == old_amount
-        )
-        same_po = candidate_po and old_po and candidate_po == old_po
-
-        if same_company and same_amount:
+        same_company = bool(candidate_company and old_company and candidate_company == old_company)
+        same_amount = candidate_amount is not None and old_amount is not None and candidate_amount == old_amount
+        same_po = bool(candidate_po and old_po and candidate_po == old_po)
+        if same_company and (same_amount or same_po):
             possible.append(old)
-        elif same_company and same_po:
-            possible.append(old)
-
     return exact, possible
 
 
-# -------------------- Save to Notion --------------------
-
 def create_invoice(token, data_source_id, fields, status, duplicate_url=""):
     properties = {
-        "Invoice Number": {
-            "title": [
-                {"text": {"content": fields["invoice_number"]}}
-            ]
-        },
-        "Company": {
-            "rich_text": [
-                {"text": {"content": fields["company"]}}
-            ]
-        },
+        "Invoice Number": {"title": [{"text": {"content": fields["invoice_number"]}}]},
+        "Company": {"rich_text": [{"text": {"content": fields["company"]}}]},
         "Status": {"select": {"name": status}},
     }
-
     if fields["invoice_date"]:
-        properties["Invoice Date"] = {
-            "date": {"start": fields["invoice_date"]}
-        }
-
+        properties["Invoice Date"] = {"date": {"start": fields["invoice_date"]}}
     if fields["amount"] is not None:
         properties["Amount"] = {"number": float(fields["amount"])}
-
     if fields["po_number"]:
-        properties["PO Number"] = {
-            "rich_text": [
-                {"text": {"content": fields["po_number"]}}
-            ]
-        }
-
-    # Duplicate Of is a URL property in the current database schema.
+        properties["PO Number"] = {"rich_text": [{"text": {"content": fields["po_number"]}}]}
     if duplicate_url:
         properties["Duplicate Of"] = {"url": duplicate_url}
-
-    payload = {
+    return notion_request("POST", "/pages", token, json={
         "parent": {"type": "data_source_id", "data_source_id": data_source_id},
         "properties": properties,
-    }
-
-    return notion_request("POST", "/pages", token, json=payload)
+    })
 
 
-# -------------------- User interface --------------------
-
-st.title("🧾 Invoice Duplicate Checker")
-st.write(
-    "Upload a PDF, review the extracted invoice details, "
-    "compare them with Notion, and decide whether to save."
-)
-
-try:
-    notion_token = st.secrets["NOTION_TOKEN"]
-    database_id = st.secrets["NOTION_DATABASE_ID"]
-except Exception:
-    st.error(
-        "Notion credentials were not found. Check that "
-        ".streamlit/secrets.toml exists and contains NOTION_TOKEN "
-        "and NOTION_DATABASE_ID. Restart Streamlit after editing it."
-    )
-    st.stop()
-
-with st.sidebar:
-    st.subheader("Connection")
-    if st.button("Test Notion connection", use_container_width=True):
-        try:
-            ds_id = get_data_source_id(notion_token, database_id)
-            rows = get_all_invoices(notion_token, ds_id)
-            st.success(f"Connected. Found {len(rows)} invoice record(s).")
-        except Exception as exc:
-            st.error(str(exc))
-
-uploaded_pdf = st.file_uploader("Choose an invoice PDF", type=["pdf"])
-
-if uploaded_pdf:
+def app():
+    st.set_page_config(page_title="Invoice Duplicate Checker", page_icon="🧾", layout="wide")
+    st.title("🧾 Invoice Duplicate Checker")
+    st.write("Upload an invoice, review the vendor and final payable total, check Notion, then save.")
     try:
-        pdf_text = extract_pdf_text(uploaded_pdf.getvalue())
+        notion_token = st.secrets["NOTION_TOKEN"]
+        database_id = st.secrets["NOTION_DATABASE_ID"]
+    except Exception:
+        st.error("Missing NOTION_TOKEN or NOTION_DATABASE_ID in .streamlit/secrets.toml")
+        st.stop()
+    with st.sidebar:
+        st.subheader("Connection")
+        if st.button("Test Notion connection", use_container_width=True):
+            try:
+                ds_id = get_data_source_id(notion_token, database_id)
+                st.success(f"Connected. Found {len(get_all_invoices(notion_token, ds_id))} invoice records.")
+            except Exception as exc:
+                st.error(str(exc))
+
+    uploaded_pdf = st.file_uploader("Choose an invoice PDF", type=["pdf"])
+    if not uploaded_pdf:
+        return
+    pdf_bytes = uploaded_pdf.getvalue()
+    import hashlib
+    file_hash = hashlib.sha256(pdf_bytes).hexdigest()
+    if st.session_state.get("active_file_hash") != file_hash:
+        for key in ("checked_fields", "checked_exact", "checked_possible", "checked_data_source_id", "checked_file_hash", "save_status"):
+            st.session_state.pop(key, None)
+        st.session_state["active_file_hash"] = file_hash
+    try:
+        pdf_text = extract_pdf_text(pdf_bytes)
         extracted = extract_invoice_fields(pdf_text)
     except Exception as exc:
         st.error(str(exc))
-        st.stop()
-
+        return
     st.subheader("1. Review extracted information")
-    st.caption(
-        "These values are guesses from the PDF. Correct them before "
-        "checking or saving."
-    )
-
+    st.caption("Company means invoice issuer/vendor (not Bill To). Amount means final amount due, including tax.")
     with st.form("invoice_review_form"):
-        col1, col2 = st.columns(2)
-
-        with col1:
-            invoice_number = st.text_input(
-                "Invoice Number", extracted["invoice_number"]
-            )
-            company = st.text_input("Company", extracted["company"])
-            po_number = st.text_input("PO Number", extracted["po_number"])
-
-        with col2:
-            date_default = None
-            if extracted["invoice_date"]:
-                try:
-                    date_default = date.fromisoformat(
-                        extracted["invoice_date"]
-                    )
-                except ValueError:
-                    pass
-
-            invoice_date = st.date_input(
-                "Invoice Date",
-                value=date_default or date.today(),
-            )
-
-            amount = st.number_input(
-                "Amount",
-                min_value=0.0,
-                value=float(extracted["amount"] or 0.0),
-                step=0.01,
-                format="%.2f",
-            )
-
-        check_clicked = st.form_submit_button(
-            "Check for duplicates", type="primary"
-        )
-
+        left, right = st.columns(2)
+        with left:
+            invoice_number = st.text_input("Invoice Number", value=extracted["invoice_number"])
+            company = st.text_input("Company (vendor)", value=extracted["company"])
+            po_number = st.text_input("PO Number", value=extracted["po_number"])
+        with right:
+            invoice_date_input = st.text_input("Invoice Date (YYYY-MM-DD, optional)", value=extracted["invoice_date"])
+            amount_input = st.text_input("Final payable amount (CAD)", value=str(extracted["amount"] or ""))
+        check_clicked = st.form_submit_button("Check for duplicates", type="primary")
     if check_clicked:
+        invoice_date = invoice_date_input.strip()
+        amount = amount_value(amount_input)
         if not invoice_number.strip():
-            st.error("Enter an invoice number before checking.")
-            st.stop()
-
-        fields = {
-            "invoice_number": invoice_number.strip(),
-            "company": company.strip(),
-            "invoice_date": invoice_date.isoformat(),
-            "amount": amount,
-            "po_number": po_number.strip(),
-        }
-
-        try:
-            with st.spinner("Checking the Notion invoice register..."):
-                data_source_id = get_data_source_id(
-                    notion_token, database_id
-                )
-                pages = get_all_invoices(notion_token, data_source_id)
-                records = [invoice_record(p) for p in pages]
-                exact, possible = find_duplicates(fields, records)
-
-            st.session_state["checked_fields"] = fields
-            st.session_state["checked_exact"] = exact
-            st.session_state["checked_possible"] = possible
-            st.session_state["checked_data_source_id"] = data_source_id
-
-        except Exception as exc:
-            st.error(str(exc))
-
-if "checked_fields" in st.session_state:
-    fields = st.session_state["checked_fields"]
-    exact = st.session_state["checked_exact"]
-    possible = st.session_state["checked_possible"]
-    data_source_id = st.session_state["checked_data_source_id"]
-
-    st.subheader("2. Duplicate check results")
-
-    if exact:
-        st.error(
-            f"Exact invoice-number match found: {len(exact)} existing record(s)."
-        )
-        st.dataframe(
-            [
-                {
-                    "Invoice Number": r["invoice_number"],
-                    "Company": r["company"],
-                    "Date": r["invoice_date"],
-                    "Amount": r["amount"],
-                    "Status": r["status"],
-                    "Open Notion record": r["url"],
-                }
-                for r in exact
-            ],
-            use_container_width=True,
-        )
-    elif possible:
-        st.warning(
-            f"{len(possible)} possible duplicate(s) found. "
-            "Review them before deciding."
-        )
-        st.dataframe(
-            [
-                {
-                    "Invoice Number": r["invoice_number"],
-                    "Company": r["company"],
-                    "Date": r["invoice_date"],
-                    "Amount": r["amount"],
-                    "PO Number": r["po_number"],
-                    "Status": r["status"],
-                    "Open Notion record": r["url"],
-                }
-                for r in possible
-            ],
-            use_container_width=True,
-        )
-    else:
-        st.success("No matching invoice was found in the current register.")
-
-    st.subheader("3. Save reviewed invoice")
-    st.caption(
-        "Saving creates a new Notion row. This does not upload or attach "
-        "the PDF itself."
-    )
-
-    if exact:
-        st.error(
-            "Saving is disabled because an exact invoice-number match exists. "
-            "Verify the existing record first."
-        )
-    else:
-        if possible:
-            status_options = ["Potential Duplicate", "Needs Review", "New"]
-            default_status = "Potential Duplicate"
+            st.error("Invoice number is required.")
+        elif not company.strip():
+            st.error("Vendor/company is required. Please correct the extraction.")
+        elif amount is None or amount < 0:
+            st.error("Enter a valid final amount. Do not use subtotal or tax alone.")
+        elif invoice_date and (not re.fullmatch(r"\d{4}-\d{2}-\d{2}", invoice_date) or not parse_date(invoice_date)):
+            st.error("Invoice date must be a valid YYYY-MM-DD date, or left blank.")
         else:
-            status_options = ["New", "Needs Review", "Potential Duplicate"]
-            default_status = "New"
-
-        selected_status = st.selectbox(
-            "Status to save", status_options,
-            index=0,
-            key="save_status",
-        )
-
-        duplicate_url = ""
-        if possible:
-            duplicate_choices = {
-                f'{r["invoice_number"]} — {r["company"]} — '
-                f'{r["amount"]} ({r["url"]})': r["url"]
-                for r in possible
+            fields = {
+                "invoice_number": invoice_number.strip(),
+                "company": company.strip(),
+                "invoice_date": invoice_date,
+                "amount": amount,
+                "po_number": po_number.strip(),
             }
-            selected_duplicate = st.selectbox(
-                "Optional: choose the matching existing record",
-                ["None"] + list(duplicate_choices.keys()),
-            )
-            if selected_duplicate != "None":
-                duplicate_url = duplicate_choices[selected_duplicate]
-
-        confirm_save = st.checkbox(
-            "I reviewed the extracted details and want to create a Notion record."
-        )
-
-        if st.button("Save invoice to Notion", type="primary"):
-            if not confirm_save:
-                st.warning("Check the confirmation box before saving.")
-            elif not fields["invoice_number"].strip():
-                st.error("Invoice Number cannot be blank.")
+            try:
+                with st.spinner("Checking existing Notion invoices..."):
+                    ds_id = get_data_source_id(notion_token, database_id)
+                    records = [invoice_record(p) for p in get_all_invoices(notion_token, ds_id)]
+                    exact, possible = find_duplicates(fields, records)
+                st.session_state.update({
+                    "checked_fields": fields,
+                    "checked_exact": exact,
+                    "checked_possible": possible,
+                    "checked_data_source_id": ds_id,
+                    "checked_file_hash": file_hash,
+                })
+            except Exception as exc:
+                st.error(str(exc))
+    if st.session_state.get("checked_file_hash") == file_hash and "checked_fields" in st.session_state:
+        fields = st.session_state["checked_fields"]
+        exact = st.session_state["checked_exact"]
+        possible = st.session_state["checked_possible"]
+        ds_id = st.session_state["checked_data_source_id"]
+        st.subheader("2. Duplicate check results")
+        st.caption(f'Checked: {fields["invoice_number"]} · {fields["company"]} · CAD {fields["amount"]}')
+        if exact or possible:
+            if exact:
+                st.error(f"{len(exact)} exact invoice-number match(es). Saving is blocked.")
             else:
-                try:
-                    result = create_invoice(
-                        notion_token,
-                        data_source_id,
-                        fields,
-                        selected_status,
-                        duplicate_url,
-                    )
-                    st.success("Invoice record created in Notion.")
-                    st.link_button(
-                        "Open the new Notion record", result["url"]
-                    )
-                    # Clear the saved check results to avoid accidental resubmission.
-                    for key in (
-                        "checked_fields",
-                        "checked_exact",
-                        "checked_possible",
-                        "checked_data_source_id",
-                    ):
-                        st.session_state.pop(key, None)
-                except Exception as exc:
-                    st.error(str(exc))
+                st.warning(f"{len(possible)} possible duplicate(s). Review before saving.")
+            st.dataframe([{
+                "Match": "Exact invoice ID" if r in exact else "Possible",
+                "Invoice Number": r["invoice_number"], "Company": r["company"],
+                "Date": r["invoice_date"], "Amount": r["amount"],
+                "PO Number": r["po_number"], "Status": r["status"],
+                "Notion record": r["url"],
+            } for r in exact + possible], use_container_width=True)
+        else:
+            st.success("No matching invoice found in the current Notion register.")
+        st.subheader("3. Save reviewed invoice")
+        if exact:
+            st.info("Verify the existing Notion record instead of creating another row.")
+        else:
+            status_options = ["Potential Duplicate", "Needs Review", "New"] if possible else ["New", "Needs Review", "Potential Duplicate"]
+            selected_status = st.selectbox("Status to save", status_options, key="save_status")
+            duplicate_url = ""
+            if possible:
+                choices = {f'{r["invoice_number"]} — {r["company"]} ({r["url"]})': r["url"] for r in possible}
+                selected = st.selectbox("Optional: link related existing record", ["None"] + list(choices))
+                duplicate_url = choices.get(selected, "")
+            confirm_save = st.checkbox("I reviewed the vendor, invoice number and final payable total.")
+            if st.button("Save invoice to Notion", type="primary"):
+                if not confirm_save:
+                    st.warning("Confirm review before saving.")
+                else:
+                    try:
+                        # Recheck immediately before saving in case register changed since initial check.
+                        fresh = [invoice_record(p) for p in get_all_invoices(notion_token, ds_id)]
+                        fresh_exact, fresh_possible = find_duplicates(fields, fresh)
+                        if fresh_exact:
+                            st.error("A matching invoice ID now exists. Save cancelled.")
+                        elif fresh_possible and not possible:
+                            st.error("A new possible duplicate appeared. Run duplicate check again before saving.")
+                        else:
+                            saved = create_invoice(notion_token, ds_id, fields, selected_status, duplicate_url)
+                            st.success("Invoice record created in Notion.")
+                            st.link_button("Open new Notion record", saved["url"])
+                            for key in ("checked_fields", "checked_exact", "checked_possible", "checked_data_source_id", "checked_file_hash"):
+                                st.session_state.pop(key, None)
+                    except Exception as exc:
+                        st.error(str(exc))
+    with st.expander("View extracted PDF text (troubleshooting)"):
+        st.text_area("PDF text", pdf_text, height=250)
 
-with st.expander("View extracted PDF text (for troubleshooting)"):
-    if uploaded_pdf:
-        st.text_area(
-            "PDF text",
-            pdf_text if "pdf_text" in locals() else "",
-            height=250,
-        )
-    else:
-        st.write("Upload a PDF to view its extracted text.")
+
+if __name__ == "__main__":
+    app()
