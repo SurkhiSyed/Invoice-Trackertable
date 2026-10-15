@@ -290,8 +290,8 @@ def app():
     st.write("Upload an invoice, review the vendor and final payable total, check Notion, then save.")
 
     try:
-        notion_token = st.secrets["NOTION_TOKEN"]
-        database_id = st.secrets["NOTION_DATABASE_ID"]
+        notion_token = os.environ["NOTION_TOKEN"]
+        database_id = os.environ["NOTION_DATABASE_ID"]
     except Exception:
         st.error("Missing NOTION_TOKEN or NOTION_DATABASE_ID in .streamlit/secrets.toml")
         st.stop()
