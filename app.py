@@ -149,7 +149,8 @@ def extract_pdf_text(pdf_bytes):
                 "unlocked PDF for this test."
             ) from exc
 
-    text = "\n".join(page.extract_text() or "" for page in reader.pages)
+    #text = "\n".join(page.extract_text() or "" for page in reader.pages)
+    text = "\n".join(page.extract_text(extraction_mode="layout") or "" for page in reader.pages)    
     if not text.strip():
         raise ValueError(
             "No selectable text was found. This may be a scanned PDF; "
@@ -166,46 +167,39 @@ def first_match(patterns, text, flags=re.IGNORECASE):
             return match.group(1).strip(" \t:#-")
     return ""
 
-
 def extract_invoice_fields(text):
-    """Best-effort extraction. Optimized to handle disjointed PDF layouts.""" 
+    """Best-effort extraction. Handles 'Track ID' variants and spatial column formatting.""" 
     
-    # 1. Clean up weird whitespace types from the PDF text stream
-    text_clean = re.sub(r'[\xa0\t]+', ' ', text)
+    # Pre-clean excessive horizontal gaps created by layout extraction mode
+    text_clean = re.sub(r' +', ' ', text)
 
-    # 2. More resilient Invoice Number patterns
     invoice_number = first_match(
         [
-            # Handles value directly following the label (allowing short numbers like #1)
-            r"\b(?:invoice\s*(?:number|no\.?|#|id)|inv\.?\s*(?:number|no\.?|#|id))\s*[:#-]?\s*([A-Z0-9][A-Z0-9/_-]*)\b",
+            # 1. Matches Invoice Track ID / Tracking ID / Reference ID variants
+            r"\b(?:invoice\s*)?(?:track(?:ing)?\s*id|reference\s*no\.?|billing\s*code)\s*[:#\s-]*\s*([A-Z0-9][A-Z0-9/_-]*)\b",
             
-            # Multi-line/Interleaved layout fallback: 
-            # Finds label, skips up to 40 characters (like column headers), captures the first alphanumeric block
-            r"\b(?:invoice\s*(?:number|no\.?|#|id)|inv\.?\s*(?:number|no\.?|#|id)).{1,40}?\b([A-Z0-9/_-]{2,15})\b",
+            # 2. Standard variants (Invoice Number, Inv #, No.)
+            r"\b(?:invoice\s*(?:number|no\.?|#|id)|inv\.?\s*(?:number|no\.?|#|id))\s*[:#\s-]*\s*([A-Z0-9][A-Z0-9/_-]*)\b",
             
-            # Ultimate fallback if it just says "Invoice: VALUE" or "Inv: VALUE"
-            r"\b(?:invoice|inv\.?)\s*[:#]\s*([A-Z0-9][A-Z0-9/_-]*)\b",
+            # 3. Aggressive loose keyword fallback (Invoice: VALUE)
+            r"\b(?:invoice|inv\.?)\s*[:#\s-]*\s*([A-Z0-9][A-Z0-9/_-]*)\b",
         ],
         text_clean,
     )
 
     po_number = first_match(
         [
-            r"\b(?:purchase\s*order|P\.?\s*O\.?)\s*(?:number|no\.?|#)?\s*[:#-]?\s*([A-Z0-9][A-Z0-9/_-]*)\b"
+            r"\b(?:purchase\s*order|P\.?\s*O\.?)\s*(?:number|no\.?|#)?\s*[:#\s-]*\s*([A-Z0-9][A-Z0-9/_-]*)\b"
         ],
         text_clean,
     )
 
-    # ... Keep your date and amount logic here (using text_clean instead of text) ...
-
     date_text = first_match(
         [
-            r"\b(?:invoice\s*date|date\s*of\s*invoice|date)\s*[:#-]?\s*"
-            r"(\d{4}[-/]\d{1,2}[-/]\d{1,2})",
-            r"\b(?:invoice\s*date|date\s*of\s*invoice|date)\s*[:#-]?\s*"
-            r"(\d{1,2}[-/]\d{1,2}[-/]\d{2,4})",
+            r"\b(?:invoice\s*date|date\s*of\s*invoice|date)\s*[:#\s-]*\s*(\d{4}[-/]\d{1,2}[-/]\d{1,2})",
+            r"\b(?:invoice\s*date|date\s*of\s*invoice|date)\s*[:#\s-]*\s*(\d{1,2}[-/]\d{1,2}[-/]\d{2,4})",
         ],
-        text,
+        text_clean,
     )
 
     invoice_date = ""
@@ -217,21 +211,17 @@ def extract_invoice_fields(text):
             "%m/%d/%y", "%d/%m/%y",
         ):
             try:
-                invoice_date = datetime.strptime(
-                    date_text, fmt
-                ).date().isoformat()
+                invoice_date = datetime.strptime(date_text, fmt).date().isoformat()
                 break
             except ValueError:
                 pass
 
     amount_text = first_match(
         [
-            r"\b(?:total\s*amount|invoice\s*total|amount\s*due|"
-            r"balance\s*due|grand\s*total|total)\s*[:$ ]+\s*"
-            r"(?:CAD\s*)?\$?\s*([\d,]+\.\d{2})",
+            r"\b(?:total\s*amount|invoice\s*total|amount\s*due|balance\s*due|grand\s*total|total)\s*[:$\s]*\s*(?:CAD\s*)?\$?\s*([\d,]+\.\d{2})",
             r"\b(?:CAD|USD)\s*\$?\s*([\d,]+\.\d{2})",
         ],
-        text,
+        text_clean,
     )
 
     amount = None
@@ -241,8 +231,7 @@ def extract_invoice_fields(text):
         except ValueError:
             amount = None
 
-    # A simple initial guess: first non-empty line, which the user can edit.
-    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    lines = [line.strip() for line in text_clean.splitlines() if line.strip()]
     company = lines[0][:100] if lines else ""
 
     return {
@@ -252,6 +241,7 @@ def extract_invoice_fields(text):
         "amount": amount,
         "po_number": po_number,
     }
+
 
 
 # -------------------- Duplicate checking --------------------
