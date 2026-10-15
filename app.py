@@ -260,10 +260,22 @@ def create_invoice(token, data_source_id, fields, status, duplicate_url=""):
 
 
 def app():
+    # 1. KEEP YOUR PAGE CONFIG FIRST
     st.set_page_config(page_title="Invoice Duplicate Checker", page_icon="🧾", layout="wide")
 
+    # 2. COMBINE ALL CSS TO HIDE FOOTER, MENU, HEADER, AND CLOUD ELEMENTS
     st.markdown("""
 <style>
+    /* Hide the official Streamlit header, footer, and hamburger menu */
+    #MainMenu {visibility: hidden;}
+    footer {visibility: hidden;}
+    header {visibility: hidden;}
+    
+    /* Hide the toolbar and deploy button on hosted cloud versions */
+    [data-testid="stToolbar"] {visibility: hidden !important;}
+    .stDeployButton {display: none;}
+
+    /* Your original code to hide the cloud viewer badge */
     [class*="viewerBadge"],
     [class*="ViewerBadge"] {
         display: none !important;
@@ -272,8 +284,10 @@ def app():
 </style>
 """, unsafe_allow_html=True)
     
+    # 3. YOUR APP CONTINUES UNCHANGED FROM HERE
     st.title("🧾 Invoice Duplicate Checker")
     st.write("Upload an invoice, review the vendor and final payable total, check Notion, then save.")
+
     try:
         notion_token = st.secrets["NOTION_TOKEN"]
         database_id = st.secrets["NOTION_DATABASE_ID"]
