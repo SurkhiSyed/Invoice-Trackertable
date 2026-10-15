@@ -261,6 +261,16 @@ def create_invoice(token, data_source_id, fields, status, duplicate_url=""):
 
 def app():
     st.set_page_config(page_title="Invoice Duplicate Checker", page_icon="🧾", layout="wide")
+    st.markdown("""
+    <style>
+        #MainMenu {visibility: hidden;}
+        footer {visibility: hidden;}
+        header {visibility: hidden;}
+        [data-testid="stToolbar"] {display: none;}
+        [data-testid="stDecoration"] {display: none;}
+        [data-testid="stStatusWidget"] {display: none;}
+    </style>
+    """, unsafe_allow_html=True)
     st.title("🧾 Invoice Duplicate Checker")
     st.write("Upload an invoice, review the vendor and final payable total, check Notion, then save.")
     try:
