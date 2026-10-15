@@ -1,5 +1,6 @@
 """Streamlit invoice tracker with review-first PDF extraction and Notion duplicate checks."""
 import re
+import os
 from datetime import date, datetime
 from decimal import Decimal, InvalidOperation
 from io import BytesIO
