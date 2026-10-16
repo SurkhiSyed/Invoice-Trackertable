@@ -240,7 +240,62 @@ def find_duplicates(candidate, existing):
     return exact, possible
 
 
-def create_invoice(token, data_source_id, fields, status, duplicate_url=""):
+def upload_invoice_pdf(token, filename, pdf_bytes):
+    """Upload an original invoice PDF to Notion."""
+
+    if len(pdf_bytes) > 5 * 1024 * 1024:
+        raise ValueError(
+            "PDF exceeds 5 MiB. This upload function is "
+            "configured for Notion's free workspace limit."
+        )
+
+    # Step 1: Create a file upload
+    created = notion_request(
+        "POST",
+        "/file_uploads",
+        token,
+        json={
+            "mode": "single_part",
+            "filename": filename,
+            "content_type": "application/pdf",
+        },
+    )
+
+    upload_id = created["id"]
+
+    # Step 2: Send the actual PDF bytes
+    response = requests.post(
+        f"{NOTION_BASE_URL}/file_uploads/{upload_id}/send",
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Notion-Version": NOTION_VERSION,
+        },
+        files={
+            "file": (filename, pdf_bytes, "application/pdf")
+        },
+        timeout=120,
+    )
+
+    if not response.ok:
+        raise RuntimeError(
+            f"PDF upload failed: {response.status_code} "
+            f"{response.text}"
+        )
+
+    result = response.json()
+
+    if result.get("status") != "uploaded":
+        raise RuntimeError(
+            f"PDF was not fully uploaded: {result}"
+        )
+
+    return upload_id
+
+
+def create_invoice(
+    token, data_source_id, fields, status,
+    duplicate_url="", pdf_upload_id="", pdf_filename=""
+):
     properties = {
         "Invoice Number": {"title": [{"text": {"content": fields["invoice_number"]}}]},
         "Company": {"rich_text": [{"text": {"content": fields["company"]}}]},
@@ -254,6 +309,18 @@ def create_invoice(token, data_source_id, fields, status, duplicate_url=""):
         properties["PO Number"] = {"rich_text": [{"text": {"content": fields["po_number"]}}]}
     if duplicate_url:
         properties["Duplicate Of"] = {"url": duplicate_url}
+    if pdf_upload_id:
+        properties["Invoice PDF"] = {
+            "files": [
+                {
+                    "name": pdf_filename,
+                    "type": "file_upload",
+                    "file_upload": {
+                        "id": pdf_upload_id
+                    },
+                }
+            ]
+        }    
     return notion_request("POST", "/pages", token, json={
         "parent": {"type": "data_source_id", "data_source_id": data_source_id},
         "properties": properties,
@@ -410,8 +477,24 @@ def app():
                             st.error("A matching invoice ID now exists. Save cancelled.")
                         elif fresh_possible and not possible:
                             st.error("A new possible duplicate appeared. Run duplicate check again before saving.")
-                        else:
-                            saved = create_invoice(notion_token, ds_id, fields, selected_status, duplicate_url)
+                        else:        
+                            with st.spinner("Uploading PDF and saving invoice to Notion..."):
+
+                                pdf_upload_id = upload_invoice_pdf(
+                                    notion_token,
+                                    uploaded_pdf.name,
+                                    pdf_bytes
+                                )
+
+                                saved = create_invoice(
+                                    notion_token,
+                                    ds_id,
+                                    fields,
+                                    selected_status,
+                                    duplicate_url,
+                                    pdf_upload_id=pdf_upload_id,
+                                    pdf_filename=uploaded_pdf.name,
+                                )
                             st.success("Invoice record created in Notion.")
                             st.link_button("Open new Notion record", saved["url"])
                             for key in ("checked_fields", "checked_exact", "checked_possible", "checked_data_source_id", "checked_file_hash"):
