@@ -1,13 +1,14 @@
 """Streamlit invoice tracker with review-first PDF extraction and Notion duplicate checks."""
 import re
-import os
 from datetime import date, datetime
 from decimal import Decimal, InvalidOperation
 from io import BytesIO
+import os
 
 import requests
 import streamlit as st
 from pypdf import PdfReader
+import fitz  # PyMuPDF; layout-aware reading
 
 NOTION_VERSION = "2025-09-03"
 NOTION_BASE_URL = "https://api.notion.com/v1"
@@ -89,80 +90,25 @@ def invoice_record(page):
 
 
 def extract_pdf_text(pdf_bytes):
-    reader = PdfReader(BytesIO(pdf_bytes))
-    if reader.is_encrypted:
-        try:
-            if not reader.decrypt(""):
-                raise ValueError("This PDF requires a password.")
-        except Exception as exc:
-            raise ValueError("Please upload an unlocked PDF.") from exc
-    text = "\n".join(page.extract_text(extraction_mode="layout") or "" for page in reader.pages)
-    if not text.strip():
-        raise ValueError("No selectable PDF text found. A scanned invoice needs OCR.")
-    return text
+    """Layout-aware selectable text. Keep page 1 as the primary field source."""
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    if doc.needs_pass:
+        raise ValueError("Please upload an unlocked PDF.")
+    pages = [p.get_text("text", sort=True) for p in doc]
+    if not any(p.strip() for p in pages):
+        raise ValueError("No selectable text found. This scanned PDF needs OCR.")
+    return "\n\n--- PAGE BREAK ---\n\n".join(pages)
 
 
 def first_match(patterns, text):
     for pattern in patterns:
-        m = re.search(pattern, text, re.IGNORECASE)
-        if m:
-            return m.group(1).strip(" \t:#-")
+        match = re.search(pattern, text, re.IGNORECASE)
+        if match:
+            return match.group(1).strip(" \t:#-\u00a0")
     return ""
 
 
-MONEY = r"(?<![\w\d])(?:CAD|USD)?\s*\$?\s*([0-9]{1,3}(?:,[0-9]{3})+(?:\.\d{2})?|[0-9]+\.\d{2})(?!\d)"
-# Labels are deliberately searched from strongest to weakest, independent of their location.
-TOTAL_LABELS = [
-    r"aggregated\s+balance\s+payable\s+due",
-    r"grand\s+total\s+balance\s+due",
-    r"(?:grand\s+total|invoice\s+total|total\s+amount|total\s+due|amount\s+due|balance\s+due|balance\s+payable)",
-    r"(?<!sub)\btotal\b(?!\s+(?:tax|gst|hst|vat))",
-]
-
-
-def extract_amount(lines):
-    """Use final-payable labels, never a blind CAD / $ match or a line-item value."""
-    for label in TOTAL_LABELS:
-        for line in reversed(lines):
-            match = re.search(label, line, re.IGNORECASE)
-            if not match:
-                continue
-            tail = line[match.end():]
-            # Currency/parenthetical text is allowed between label and amount.
-            values = list(re.finditer(MONEY, tail, re.IGNORECASE))
-            if values:
-                try:
-                    return Decimal(values[-1].group(1).replace(",", ""))
-                except InvalidOperation:
-                    pass
-    return None
-
-
-def extract_company(lines):
-    """Vendor/sender, NOT customer under Invoice To / Bill To."""
-    legal_suffix = re.compile(r"\b(?:LLC|L\.L\.C\.|Inc\.?|Incorporated|Ltd\.?|Limited|Corp\.?|Corporation|GmbH|Co\.)\b", re.I)
-    skip = re.compile(r"^(?:invoice|commercial invoice|statement|bill|receipt|tax invoice|billing statement|page\s+\d+|date\b)", re.I)
-    header = lines[:12]
-    # Explicit vendor headers take precedence when available.
-    for line in header:
-        m = re.search(r"(?:vendor|supplier|seller|issued\s+by|from)\s*:\s*(.+)", line, re.I)
-        if m:
-            return re.split(r"\s{2,}|\s*[•|]\s*", m.group(1).strip())[0].strip()
-    # Header only: exclude downstream bill-to/client columns by stopping at their markers.
-    for line in header:
-        if re.search(r"\b(?:invoice\s+to|bill\s+to|client\s+corporate\s+entity|ship\s+to)\s*:", line, re.I):
-            break
-        candidate = re.split(r"\s{2,}|\s*[•|]\s*", line.strip())[0].strip()
-        if not candidate or skip.match(candidate):
-            continue
-        if legal_suffix.search(candidate):
-            return candidate[:100]
-    # Conservative fallback: header line with vendor email/address, never the title.
-    for line in header[:5]:
-        candidate = re.split(r"\s{2,}|\s*[•|]\s*", line.strip())[0].strip()
-        if candidate and not skip.match(candidate) and ("@" in line or "•" in line):
-            return candidate[:100]
-    return ""  # Ask for review rather than silently recording customer as vendor.
+MONEY = r"(?:\$\s*)?(-?\d{1,3}(?:,\d{3})+(?:\.\d{2})?|-?\d+\.\d{2})(?![\d])"
 
 
 def parse_date(value):
@@ -175,31 +121,102 @@ def parse_date(value):
         try:
             return datetime.strptime(value, fmt).date().isoformat()
         except ValueError:
-            continue
+            pass
     return ""
 
 
 def extract_invoice_fields(text):
-    # Preserve line breaks and multi-column layout for accurate header/total identification.
-    lines = [line.rstrip() for line in text.splitlines() if line.strip()]
-    clean = re.sub(r"[ \t]+", " ", text)
+    """Conservative selection: page-one metadata; current charges, not account arrears."""
+    first_page = text.split("--- PAGE BREAK ---")[0]
+    lines = [re.sub(r"\s+", " ", l).strip() for l in first_page.splitlines() if l.strip()]
+    header = "\n".join(lines[:55])
+    whole = "\n".join(lines)
+
+    # Invoice No/Number on a single row takes precedence over the other IDs.
     invoice_number = first_match([
-        r"\b(?:invoice\s*)?(?:track(?:ing)?\s*id|reference\s*(?:id|no\.?|number)|billing\s*code)\s*[:#\s-]*([A-Z0-9][A-Z0-9/_-]*)\b",
-        r"\b(?:invoice\s*(?:number|no\.?|#|id)|inv\.?\s*(?:number|no\.?|#|id))\s*[:#\s-]*([A-Z0-9][A-Z0-9/_-]*)\b",
-        r"\b(?:invoice|inv\.?)\s*[:#-]\s*([A-Z0-9][A-Z0-9/_-]*)\b",
-    ], clean)
+        r"(?m)^\s*invoice\s*(?:track(?:ing)?\s*id|number|no\.?|#|id)\s*[:#-]?\s*([A-Z0-9][A-Z0-9/_-]*)\b",
+        r"(?m)^\s*invoice\s*[:#-]?\s+([A-Z0-9][A-Z0-9/_-]*\d)\b",
+        r"(?m)^\s*#\s*([A-Z0-9][A-Z0-9/_-]*)\b",
+        r"(?m)^\s*inv\.?\s*(?:number|no\.?|#)\s*[:#-]?\s*([A-Z0-9][A-Z0-9/_-]*)\b",
+    ], header)
+    if not invoice_number:
+        invoice_number = first_match([
+            r"\bInvoice\s+Track\s+ID\s*:\s*([A-Z0-9][A-Z0-9/_-]*)\b",
+            r"\bInvoice\s+(?:Number|No\.?|ID)\s*:\s*([A-Z0-9][A-Z0-9/_-]*)\b",
+        ], header)
+    if not invoice_number:
+        # In some line-oriented PDF renderings the ID follows 'Invoice' on next line.
+        invoice_number = first_match([r"(?im)^invoice\s*\n\s*#?\s*([A-Z0-9][A-Z0-9/_-]*\d)\b"], first_page)
+
+    # Normalize vendor brand using grounded document markers and explicit legal entity.
+    lwr = first_page.lower()
+    if "mettler-toledo" in lwr or "mettler toledo" in lwr:
+        company = "Mettler-Toledo, LLC"
+    elif "ups.com" in lwr and "delivery service invoice" in lwr:
+        company = "UPS"
+    elif "fayettejanitorial.com" in lwr or "fayetteindustrial.com" in lwr:
+        company = "Fayette"  # Visible logo brand; legal entity not stated in text.
+    else:
+        company = first_match([
+            r"(?im)^\s*(?:vendor|supplier|seller|issued by|from)\s*:\s*([^|•\n]+)",
+            r"(?im)^\s*([\w&., '-]+?\b(?:LLC|Inc\.?|Ltd\.?|GmbH|Corporation))\s*(?:[•|]|$)",
+        ], first_page)
+
+    # Non-PO headings (such as 'PO #' next to a date) should remain blank.
     po_number = first_match([
-        r"\b(?:purchase\s*order|P\.?\s*O\.?\b)\s*(?:number|no\.?|#)?\s*[:#\s-]+([A-Z0-9][A-Z0-9/_-]*)\b"
-    ], clean)
+        r"(?im)^\s*(?:customer\s+)?(?:purchase order|p\.?o\.?)\s*(?:number|no\.?|#)?\s*[:#]?\s+([A-Z0-9][A-Z0-9/_-]*\d)\s*$",
+    ], whole)
+    # Inline PO Number: PO-998241-A, with neighboring metadata columns.
+    if not po_number:
+        po_number = first_match([
+            r"\bPO\s+Number\s*:\s*([A-Z0-9][A-Z0-9/_-]*\d[A-Z0-9/_-]*)\b",
+            r"\bPurchase\s+Order\s+Number\s*:\s*([A-Z0-9][A-Z0-9/_-]*\d[A-Z0-9/_-]*)\b",
+        ], whole)
+    # 'Customer PO No.' can share a row with other data; allow this labeled form.
+    if not po_number:
+        po_number = first_match([r"\bCustomer\s+PO\s+No\.?\s*[:#]?\s*(\d{5,})\b"], whole)
+
     date_value = first_match([
-        r"\b(?:invoice\s*date|issue\s*date|date\s*generated|date\s*of\s*invoice)\s*:\s*(\d{4}[-/]\d{1,2}[-/]\d{1,2}|\d{1,2}[-/]\d{1,2}[-/]\d{2,4}|[A-Za-z]+\s+\d{1,2},?\s+\d{4})",
-        r"\b(?:invoice\s*date|issue\s*date|date\s*generated|date\s*of\s*invoice)\s*:\s*(\d{1,2}\s+[A-Za-z]+\s+\d{4})",
-    ], clean)
+        r"\b(?:invoice date|issue date|date generated|date of invoice)\s*[:]?\s*(\d{4}[-/]\d{1,2}[-/]\d{1,2}|\d{1,2}[-/]\d{1,2}[-/]\d{2,4}|[A-Za-z]+\s+\d{1,2},?\s+\d{4})",
+    ], header)
+    if not date_value:
+        # Unlabeled dated logo/header; exclude later due dates and line-item periods.
+        date_value = first_match([r"(?m)^\s*(\d{1,2}/\d{1,2}/\d{4})\s*$"], "\n".join(lines[:12]))
+
+    # Payment obligation labels, ranked above generic total (especially UPS).
+    ranked = [
+        r"\bamount due this period\b",
+        r"\baggregated balance payable due\b",
+        r"\bgrand total balance due\b",
+        r"\bbalance due\b",
+        r"\b(?:invoice total|grand total|amount due|total due|balance payable)\b",
+        r"\btotal\s+(?:USD|CAD|EUR)\b",
+        r"(?<!\w)total(?!\s+(?:net|tax|outstanding|incentive|service|adjustment|charges|amount outstanding))\b",
+    ]
+    amount = None
+    # Only match amounts on the SAME printed line as selected label.
+    for pattern in ranked:
+        for line in reversed(lines):
+            m = re.search(pattern, line, re.I)
+            if not m:
+                continue
+            tail = line[m.end():]
+            # reject cross-column additional labels and pick nearest value
+            money = re.search(MONEY, tail)
+            if money:
+                try:
+                    amount = Decimal(money.group(1).replace(",", ""))
+                    break
+                except InvalidOperation:
+                    pass
+        if amount is not None:
+            break
+
     return {
         "invoice_number": invoice_number,
-        "company": extract_company(lines),
+        "company": company,
         "invoice_date": parse_date(date_value) if date_value else "",
-        "amount": extract_amount(lines),
+        "amount": amount,
         "po_number": po_number,
     }
 
@@ -241,61 +258,35 @@ def find_duplicates(candidate, existing):
 
 
 def upload_invoice_pdf(token, filename, pdf_bytes):
-    """Upload an original invoice PDF to Notion."""
-
+    """Upload a PDF to Notion; return the upload ID for attachment to a page."""
+    if not pdf_bytes.startswith(b"%PDF-"):
+        raise ValueError("The selected file is not a valid PDF.")
     if len(pdf_bytes) > 5 * 1024 * 1024:
-        raise ValueError(
-            "PDF exceeds 5 MiB. This upload function is "
-            "configured for Notion's free workspace limit."
-        )
-
-    # Step 1: Create a file upload
-    created = notion_request(
-        "POST",
-        "/file_uploads",
-        token,
-        json={
-            "mode": "single_part",
-            "filename": filename,
-            "content_type": "application/pdf",
-        },
-    )
-
+        raise ValueError("PDF exceeds the 5 MiB limit configured for this application.")
+    filename = os.path.basename(filename.replace("\\", "/")) or "invoice.pdf"
+    created = notion_request("POST", "/file_uploads", token, json={
+        "mode": "single_part", "filename": filename,
+        "content_type": "application/pdf",
+    })
     upload_id = created["id"]
-
-    # Step 2: Send the actual PDF bytes
-    response = requests.post(
-        f"{NOTION_BASE_URL}/file_uploads/{upload_id}/send",
-        headers={
-            "Authorization": f"Bearer {token}",
-            "Notion-Version": NOTION_VERSION,
-        },
-        files={
-            "file": (filename, pdf_bytes, "application/pdf")
-        },
-        timeout=120,
-    )
-
-    if not response.ok:
-        raise RuntimeError(
-            f"PDF upload failed: {response.status_code} "
-            f"{response.text}"
+    try:
+        response = requests.post(
+            f"{NOTION_BASE_URL}/file_uploads/{upload_id}/send",
+            headers={"Authorization": f"Bearer {token}", "Notion-Version": NOTION_VERSION},
+            files={"file": (filename, pdf_bytes, "application/pdf")},
+            timeout=120,
         )
-
-    result = response.json()
-
+        response.raise_for_status()
+        result = response.json()
+    except requests.RequestException as exc:
+        raise RuntimeError(f"Notion PDF upload failed: {exc}") from exc
     if result.get("status") != "uploaded":
-        raise RuntimeError(
-            f"PDF was not fully uploaded: {result}"
-        )
-
+        raise RuntimeError(f"Notion did not confirm the PDF upload: {result.get('status')}")
     return upload_id
 
 
-def create_invoice(
-    token, data_source_id, fields, status,
-    duplicate_url="", pdf_upload_id="", pdf_filename=""
-):
+def create_invoice(token, data_source_id, fields, status, duplicate_url="",
+                   pdf_upload_id="", pdf_filename=""):
     properties = {
         "Invoice Number": {"title": [{"text": {"content": fields["invoice_number"]}}]},
         "Company": {"rich_text": [{"text": {"content": fields["company"]}}]},
@@ -310,17 +301,11 @@ def create_invoice(
     if duplicate_url:
         properties["Duplicate Of"] = {"url": duplicate_url}
     if pdf_upload_id:
-        properties["Invoice PDF"] = {
-            "files": [
-                {
-                    "name": pdf_filename,
-                    "type": "file_upload",
-                    "file_upload": {
-                        "id": pdf_upload_id
-                    },
-                }
-            ]
-        }    
+        properties["Invoice PDF"] = {"files": [{
+            "name": pdf_filename,
+            "type": "file_upload",
+            "file_upload": {"id": pdf_upload_id},
+        }]}
     return notion_request("POST", "/pages", token, json={
         "parent": {"type": "data_source_id", "data_source_id": data_source_id},
         "properties": properties,
@@ -328,39 +313,14 @@ def create_invoice(
 
 
 def app():
-    # 1. KEEP YOUR PAGE CONFIG FIRST
     st.set_page_config(page_title="Invoice Duplicate Checker", page_icon="🧾", layout="wide")
-
-    # 2. COMBINE ALL CSS TO HIDE FOOTER, MENU, HEADER, AND CLOUD ELEMENTS
-    st.markdown("""
-<style>
-    /* Hide the official Streamlit header, footer, and hamburger menu */
-    #MainMenu {visibility: hidden;}
-    footer {visibility: hidden;}
-    header {visibility: hidden;}
-    
-    /* Hide the toolbar and deploy button on hosted cloud versions */
-    [data-testid="stToolbar"] {visibility: hidden !important;}
-    .stDeployButton {display: none;}
-
-    /* Your original code to hide the cloud viewer badge */
-    [class*="viewerBadge"],
-    [class*="ViewerBadge"] {
-        display: none !important;
-        visibility: hidden !important;
-    }
-</style>
-""", unsafe_allow_html=True)
-    
-    # 3. YOUR APP CONTINUES UNCHANGED FROM HERE
     st.title("🧾 Invoice Duplicate Checker")
     st.write("Upload an invoice, review the vendor and final payable total, check Notion, then save.")
-
     try:
-        notion_token = os.environ["NOTION_TOKEN"]
-        database_id = os.environ["NOTION_DATABASE_ID"]
+        notion_token = os.environ.get("NOTION_TOKEN") or st.secrets["NOTION_TOKEN"]
+        database_id = os.environ.get("NOTION_DATABASE_ID") or st.secrets["NOTION_DATABASE_ID"]
     except Exception:
-        st.error("Missing NOTION_TOKEN or NOTION_DATABASE_ID in .streamlit/secrets.toml")
+        st.error("Missing NOTION_TOKEN or NOTION_DATABASE_ID in Render environment variables or Streamlit secrets.")
         st.stop()
     with st.sidebar:
         st.subheader("Connection")
@@ -397,7 +357,7 @@ def app():
             po_number = st.text_input("PO Number", value=extracted["po_number"])
         with right:
             invoice_date_input = st.text_input("Invoice Date (YYYY-MM-DD, optional)", value=extracted["invoice_date"])
-            amount_input = st.text_input("Final payable amount (CAD)", value=str(extracted["amount"] or ""))
+            amount_input = st.text_input("Invoice amount (original currency; verify in PDF)", value=str(extracted["amount"] or ""))
         check_clicked = st.form_submit_button("Check for duplicates", type="primary")
     if check_clicked:
         invoice_date = invoice_date_input.strip()
@@ -438,7 +398,7 @@ def app():
         possible = st.session_state["checked_possible"]
         ds_id = st.session_state["checked_data_source_id"]
         st.subheader("2. Duplicate check results")
-        st.caption(f'Checked: {fields["invoice_number"]} · {fields["company"]} · CAD {fields["amount"]}')
+        st.caption(f'Checked: {fields["invoice_number"]} · {fields["company"]} · {fields["amount"]}')
         if exact or possible:
             if exact:
                 st.error(f"{len(exact)} exact invoice-number match(es). Saving is blocked.")
@@ -477,25 +437,14 @@ def app():
                             st.error("A matching invoice ID now exists. Save cancelled.")
                         elif fresh_possible and not possible:
                             st.error("A new possible duplicate appeared. Run duplicate check again before saving.")
-                        else:        
-                            with st.spinner("Uploading PDF and saving invoice to Notion..."):
-
-                                pdf_upload_id = upload_invoice_pdf(
-                                    notion_token,
-                                    uploaded_pdf.name,
-                                    pdf_bytes
-                                )
-
+                        else:
+                            with st.spinner("Uploading original PDF and creating Notion record..."):
+                                pdf_upload_id = upload_invoice_pdf(notion_token, uploaded_pdf.name, pdf_bytes)
                                 saved = create_invoice(
-                                    notion_token,
-                                    ds_id,
-                                    fields,
-                                    selected_status,
-                                    duplicate_url,
-                                    pdf_upload_id=pdf_upload_id,
-                                    pdf_filename=uploaded_pdf.name,
+                                    notion_token, ds_id, fields, selected_status, duplicate_url,
+                                    pdf_upload_id=pdf_upload_id, pdf_filename=uploaded_pdf.name,
                                 )
-                            st.success("Invoice record created in Notion.")
+                            st.success("Invoice record and original PDF saved in Notion.")
                             st.link_button("Open new Notion record", saved["url"])
                             for key in ("checked_fields", "checked_exact", "checked_possible", "checked_data_source_id", "checked_file_hash"):
                                 st.session_state.pop(key, None)

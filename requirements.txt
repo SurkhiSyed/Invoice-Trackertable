@@ -3,3 +3,4 @@ streamlit
 pypdf
 notion-client
 requests
+PyMuPDF
